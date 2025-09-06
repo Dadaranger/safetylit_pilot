@@ -1,0 +1,36 @@
+{
+  "rows": 995,
+  "generated_at_utc": "2025-09-06T21:18:01.527428",
+  "rules": {
+    "citation_complete": {
+      "pass": 995,
+      "pass_rate_pct": 100.0,
+      "fail": 0
+    },
+    "citation_format": {
+      "pass": 0,
+      "pass_rate_pct": 0.0,
+      "fail": 995
+    },
+    "duplicates": {
+      "duplicate_count": 0
+    }
+  },
+  "stats": {
+    "total_entries": 995,
+    "citation_components": {
+      "has_authors": {
+        "count": 995,
+        "percentage": 100.0
+      },
+      "has_journal": {
+        "count": 995,
+        "percentage": 100.0
+      },
+      "has_year": {
+        "count": 995,
+        "percentage": 100.0
+      }
+    }
+  }
+}
