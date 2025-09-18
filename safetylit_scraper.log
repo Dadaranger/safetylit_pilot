@@ -1,0 +1,28 @@
+2025-09-17 20:23:25,519 - INFO - Starting scraping for 2024-02 with 4 PDFs
+2025-09-17 20:23:25,534 - INFO - Incremental updates: disabled
+2025-09-17 20:23:25,534 - INFO - Quality control: disabled
+2025-09-17 20:23:25,534 - INFO - Processing PDF 1/4: https://www.safetylit.org/week/2024/240204.pdf
+2025-09-17 20:24:13,711 - INFO - Successfully parsed 182 entries from https://www.safetylit.org/week/2024/240204.pdf
+2025-09-17 20:24:13,712 - INFO - Processing PDF 2/4: https://www.safetylit.org/week/2024/240211.pdf
+2025-09-17 20:25:13,037 - INFO - Successfully parsed 223 entries from https://www.safetylit.org/week/2024/240211.pdf
+2025-09-17 20:25:13,040 - INFO - Processing PDF 3/4: https://www.safetylit.org/week/2024/240218.pdf
+2025-09-17 20:26:12,846 - INFO - Successfully parsed 209 entries from https://www.safetylit.org/week/2024/240218.pdf
+2025-09-17 20:26:12,846 - INFO - Processing PDF 4/4: https://www.safetylit.org/week/2024/240225.pdf
+2025-09-17 20:27:07,362 - INFO - Successfully parsed 207 entries from https://www.safetylit.org/week/2024/240225.pdf
+2025-09-17 20:27:07,365 - INFO - Total entries parsed: 821
+2025-09-17 20:27:07,365 - INFO - Final dataset size: 821 entries
+2025-09-17 20:27:07,507 - INFO - Scraping completed successfully
+2025-09-17 20:40:52,284 - INFO - Starting scraping for 2024-02 with 4 PDFs
+2025-09-17 20:40:52,284 - INFO - Incremental updates: disabled
+2025-09-17 20:40:52,284 - INFO - Quality control: disabled
+2025-09-17 20:40:52,284 - INFO - Processing PDF 1/4: https://www.safetylit.org/week/2024/240204.pdf
+2025-09-17 20:41:44,811 - INFO - Successfully parsed 182 entries from https://www.safetylit.org/week/2024/240204.pdf
+2025-09-17 20:41:44,812 - INFO - Processing PDF 2/4: https://www.safetylit.org/week/2024/240211.pdf
+2025-09-17 20:42:43,362 - INFO - Successfully parsed 223 entries from https://www.safetylit.org/week/2024/240211.pdf
+2025-09-17 20:42:43,362 - INFO - Processing PDF 3/4: https://www.safetylit.org/week/2024/240218.pdf
+2025-09-17 20:43:40,815 - INFO - Successfully parsed 209 entries from https://www.safetylit.org/week/2024/240218.pdf
+2025-09-17 20:43:40,815 - INFO - Processing PDF 4/4: https://www.safetylit.org/week/2024/240225.pdf
+2025-09-17 20:44:37,494 - INFO - Successfully parsed 207 entries from https://www.safetylit.org/week/2024/240225.pdf
+2025-09-17 20:44:37,495 - INFO - Total entries parsed: 821
+2025-09-17 20:44:37,515 - INFO - Final dataset size: 821 entries
+2025-09-17 20:44:37,591 - INFO - Scraping completed successfully

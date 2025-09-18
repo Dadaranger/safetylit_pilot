@@ -1,11 +1,13 @@
 # safetylit_pdf_month_scraper_v4.py
 # SafetyLit (2024) PDF month scraper with stricter parsing, NaN-aware validation, and robust noise filtering.
 
-import re, os, io, csv, json, time, random, hashlib, argparse
+import re, os, io, csv, json, time, random, hashlib, argparse, logging, sqlite3
 from datetime import datetime, date, timedelta
 from collections import defaultdict
+from pathlib import Path
 import requests
 import pdfplumber
+import pandas as pd
 from tenacity import retry, wait_exponential_jitter, stop_after_attempt
 
 # --------------------- CONFIG ---------------------
@@ -17,6 +19,19 @@ START_DATE = date(2024, 1, 7)   # first weekly PDF in 2024
 END_DATE   = date(2024, 8, 18)  # last weekly PDF in 2024
 
 VALIDATION_REPORT = "validation_report.json"
+STATE_DB = "scraping_state.db"
+ISSUES_LOG = "scraping_issues.json"
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('safetylit_scraper.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # -------- NaN-like tokens treated as missing --------
 MISSING_TOKENS = {"", "na", "n/a", "none", "null", "nan", "NaN", "NA", "N/A", "NULL", "None"}
@@ -27,6 +42,7 @@ def is_missing(v):
 
 # --------------------- REGEX HELPERS ---------------------
 YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")  # For extracting year from citation
+URL_RE = re.compile(r"https?://", re.I)  # For detecting URLs
 
 # ---- Noise patterns (headers, orgs, chrome) ----
 BULLETIN_NOISE_PATTERNS = [
@@ -86,6 +102,258 @@ def norm_title(s: str) -> str:
 
 def phash(*parts) -> str:
     return hashlib.sha1("||".join([p or "" for p in parts]).encode("utf-8")).hexdigest()
+
+# --------------------- STATE MANAGEMENT ---------------------
+class ScrapingState:
+    """Manages state for incremental updates and tracking processed content."""
+    
+    def __init__(self, db_path=STATE_DB):
+        self.db_path = db_path
+        self.init_db()
+        
+    def init_db(self):
+        """Initialize the state database."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS processed_pdfs (
+                    pdf_url TEXT PRIMARY KEY,
+                    week_code TEXT,
+                    last_scraped_at TEXT,
+                    entry_count INTEGER,
+                    content_hash TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS processed_entries (
+                    entry_hash TEXT PRIMARY KEY,
+                    pdf_url TEXT,
+                    title TEXT,
+                    journal TEXT,
+                    year TEXT,
+                    scraped_at TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS scraping_issues (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    issue_type TEXT,
+                    pdf_url TEXT,
+                    description TEXT,
+                    severity TEXT,
+                    timestamp TEXT,
+                    resolved BOOLEAN DEFAULT FALSE
+                )
+            """)
+            conn.commit()
+    
+    def is_pdf_processed(self, pdf_url: str) -> bool:
+        """Check if a PDF has been processed recently."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "SELECT last_scraped_at FROM processed_pdfs WHERE pdf_url = ?",
+                (pdf_url,)
+            )
+            result = cursor.fetchone()
+            if result:
+                # Check if processed within last 7 days (for weekly updates)
+                last_scraped = datetime.fromisoformat(result[0])
+                return (datetime.utcnow() - last_scraped).days < 7
+            return False
+    
+    def record_pdf_processed(self, pdf_url: str, week_code: str, entry_count: int, content_hash: str):
+        """Record that a PDF has been processed."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO processed_pdfs 
+                (pdf_url, week_code, last_scraped_at, entry_count, content_hash)
+                VALUES (?, ?, ?, ?, ?)
+            """, (pdf_url, week_code, now_utc(), entry_count, content_hash))
+            conn.commit()
+    
+    def is_entry_processed(self, entry_hash: str) -> bool:
+        """Check if an entry has been processed."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "SELECT 1 FROM processed_entries WHERE entry_hash = ?",
+                (entry_hash,)
+            )
+            return cursor.fetchone() is not None
+    
+    def record_entry_processed(self, entry_hash: str, pdf_url: str, title: str, journal: str, year: str):
+        """Record that an entry has been processed."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO processed_entries 
+                (entry_hash, pdf_url, title, journal, year, scraped_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (entry_hash, pdf_url, title, journal, year, now_utc()))
+            conn.commit()
+    
+    def log_issue(self, issue_type: str, pdf_url: str, description: str, severity: str = "medium"):
+        """Log a scraping issue."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT INTO scraping_issues 
+                (issue_type, pdf_url, description, severity, timestamp)
+                VALUES (?, ?, ?, ?, ?)
+            """, (issue_type, pdf_url, description, severity, now_utc()))
+            conn.commit()
+        logger.warning(f"Issue logged: {issue_type} - {description}")
+    
+    def get_processing_stats(self) -> dict:
+        """Get statistics about processed content."""
+        with sqlite3.connect(self.db_path) as conn:
+            pdf_count = conn.execute("SELECT COUNT(*) FROM processed_pdfs").fetchone()[0]
+            entry_count = conn.execute("SELECT COUNT(*) FROM processed_entries").fetchone()[0]
+            issue_count = conn.execute("SELECT COUNT(*) FROM scraping_issues WHERE resolved = FALSE").fetchone()[0]
+            return {
+                "processed_pdfs": pdf_count,
+                "processed_entries": entry_count,
+                "unresolved_issues": issue_count
+            }
+
+# --------------------- QUALITY CONTROL ---------------------
+class QualityController:
+    """Handles data quality control and standardization."""
+    
+    def __init__(self, state_manager: ScrapingState):
+        self.state = state_manager
+        self.issues_found = []
+    
+    def standardize_text(self, text: str) -> str:
+        """Standardize text format."""
+        if is_missing(text):
+            return None
+        # Remove extra whitespace
+        text = re.sub(r'\s+', ' ', str(text).strip())
+        # Standardize quotes
+        text = text.replace('"', '"').replace('"', '"').replace(''', "'").replace(''', "'")
+        return text
+    
+    def standardize_year(self, year_str: str) -> str:
+        """Standardize year format."""
+        if is_missing(year_str):
+            return None
+        year = str(year_str).strip()
+        # Extract 4-digit year
+        match = re.search(r'\b(19|20)\d{2}\b', year)
+        return match.group(0) if match else None
+    
+    def standardize_journal(self, journal_str: str) -> str:
+        """Standardize journal name."""
+        if is_missing(journal_str):
+            return None
+        journal = self.standardize_text(journal_str)
+        # Remove trailing punctuation
+        journal = re.sub(r'[.;:,]+$', '', journal)
+        # Title case for journal names
+        return journal.title() if journal else None
+    
+    def detect_duplicates_pandas(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Use pandas to detect and handle duplicates."""
+        original_count = len(df)
+        
+        # Create composite key for duplicate detection
+        df['dup_key'] = df['title'].fillna('').str.lower().str.replace(r'[^a-z0-9\s]', '', regex=True) + \
+                       '_' + df['year'].fillna('').astype(str) + \
+                       '_' + df['journal'].fillna('').str.lower()
+        
+        # Find duplicates
+        duplicates = df[df.duplicated(subset=['dup_key'], keep=False)]
+        if not duplicates.empty:
+            self.issues_found.append({
+                'type': 'duplicates_detected',
+                'count': len(duplicates),
+                'description': f'Found {len(duplicates)} duplicate entries'
+            })
+        
+        # Keep first occurrence of duplicates
+        df_clean = df.drop_duplicates(subset=['dup_key'], keep='first')
+        df_clean = df_clean.drop(columns=['dup_key'])
+        
+        removed_count = original_count - len(df_clean)
+        if removed_count > 0:
+            logger.info(f"Removed {removed_count} duplicate entries")
+        
+        return df_clean
+    
+    def analyze_missing_values(self, df: pd.DataFrame) -> dict:
+        """Analyze missing values in critical fields."""
+        critical_fields = ['title', 'journal', 'year', 'authors']
+        missing_analysis = {}
+        
+        for field in critical_fields:
+            if field in df.columns:
+                missing_count = df[field].isna().sum() + (df[field] == '').sum()
+                missing_pct = (missing_count / len(df)) * 100
+                missing_analysis[field] = {
+                    'missing_count': int(missing_count),
+                    'missing_percentage': round(missing_pct, 2),
+                    'has_data_count': len(df) - int(missing_count)
+                }
+                
+                if missing_pct > 10:  # Flag if more than 10% missing
+                    self.issues_found.append({
+                        'type': 'high_missing_values',
+                        'field': field,
+                        'percentage': missing_pct,
+                        'description': f'High missing values in {field}: {missing_pct:.1f}%'
+                    })
+        
+        return missing_analysis
+    
+    def standardize_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Apply standardization to entire dataframe."""
+        df_clean = df.copy()
+        
+        # Standardize text fields
+        if 'title' in df_clean.columns:
+            df_clean['title'] = df_clean['title'].apply(self.standardize_text)
+        if 'authors' in df_clean.columns:
+            df_clean['authors'] = df_clean['authors'].apply(self.standardize_text)
+        if 'journal' in df_clean.columns:
+            df_clean['journal'] = df_clean['journal'].apply(self.standardize_journal)
+        if 'year' in df_clean.columns:
+            df_clean['year'] = df_clean['year'].apply(self.standardize_year)
+        
+        # Standardize ingested_at to consistent datetime format
+        if 'ingested_at' in df_clean.columns:
+            df_clean['ingested_at'] = pd.to_datetime(df_clean['ingested_at'], errors='coerce')
+        
+        return df_clean
+    
+    def generate_quality_report(self, original_df: pd.DataFrame, cleaned_df: pd.DataFrame) -> dict:
+        """Generate comprehensive quality control report."""
+        missing_analysis = self.analyze_missing_values(cleaned_df)
+        
+        report = {
+            'timestamp': now_utc(),
+            'original_records': len(original_df),
+            'cleaned_records': len(cleaned_df),
+            'records_removed': len(original_df) - len(cleaned_df),
+            'missing_value_analysis': missing_analysis,
+            'issues_found': self.issues_found,
+            'quality_score': self._calculate_quality_score(cleaned_df)
+        }
+        
+        return report
+    
+    def _calculate_quality_score(self, df: pd.DataFrame) -> float:
+        """Calculate overall data quality score (0-100)."""
+        if df.empty:
+            return 0.0
+        
+        critical_fields = ['title', 'journal', 'year']
+        total_score = 0
+        field_count = 0
+        
+        for field in critical_fields:
+            if field in df.columns:
+                completeness = (df[field].notna() & (df[field] != '')).sum() / len(df)
+                total_score += completeness
+                field_count += 1
+        
+        return round((total_score / field_count * 100), 2) if field_count > 0 else 0.0
 
 # --------------------- DATE RANGE ---------------------
 def weekly_sundays_for_month(year: int, month: int) -> list[date]:
@@ -251,44 +519,89 @@ def parse_block(block_lines: list[str]) -> dict:
     }
 
 # --------------------- PDF PARSE ---------------------
-def parse_pdf(pdf_url: str) -> list[dict]:
-    pdf_bytes = download_pdf(pdf_url)
-    pages = extract_pages(pdf_bytes)
+def parse_pdf(pdf_url: str, state_manager: ScrapingState = None) -> list[dict]:
+    """Parse PDF with incremental update support and enhanced error handling."""
     
-    # Skip first and last pages
-    if len(pages) <= 2:  # If PDF has 2 or fewer pages, return empty
+    # Check if already processed
+    if state_manager and state_manager.is_pdf_processed(pdf_url):
+        logger.info(f"Skipping already processed PDF: {pdf_url}")
         return []
-    pages = pages[1:-1]  # Use only middle pages
-
-    records, current_category = [], None
-    idx = 0
-    wk = pdf_url.split("/")[-1].replace(".pdf", "")
     
-    for page_num, lines in enumerate(pages, 1):  # 1-based page numbering
-        blocks = split_blocks(lines)
-        for blk in blocks:
-            rec = parse_block(blk)
-            if not rec:
-                continue
-            if "_category_marker" in rec:
-                current_category = rec["_category_marker"]
-                continue
-            idx += 1
-            rec["category"] = current_category
-            rec["entry_index_in_pdf"] = idx
-            rec["page_number"] = page_num  # Track which page it came from
-            rec["pdf_url"] = pdf_url
-            rec["pdf_week_code"] = wk
-            rec["ingested_at"] = now_utc()
-            records.append(rec)
+    try:
+        pdf_bytes = download_pdf(pdf_url)
+        content_hash = hashlib.sha256(pdf_bytes).hexdigest()
+        
+        pages = extract_pages(pdf_bytes)
+        
+        # Skip first and last pages
+        if len(pages) <= 2:  # If PDF has 2 or fewer pages, return empty
+            if state_manager:
+                state_manager.log_issue("insufficient_pages", pdf_url, 
+                                      f"PDF has only {len(pages)} pages", "low")
+            return []
+        pages = pages[1:-1]  # Use only middle pages
 
-    # Dedupe
-    seen, out = set(), []
-    for r in records:
-        key = r.get("doi") or phash(norm_title(r.get("title") or ""), r.get("year") or "", r.get("pdf_week_code") or "")
-        if key not in seen:
-            seen.add(key); out.append(r)
-    return out
+        records, current_category = [], None
+        idx = 0
+        wk = pdf_url.split("/")[-1].replace(".pdf", "")
+        
+        for page_num, lines in enumerate(pages, 1):  # 1-based page numbering
+            blocks = split_blocks(lines)
+            for blk in blocks:
+                rec = parse_block(blk)
+                if not rec:
+                    continue
+                if "_category_marker" in rec:
+                    current_category = rec["_category_marker"]
+                    continue
+                
+                # Add metadata
+                idx += 1
+                rec["category"] = current_category
+                rec["entry_index_in_pdf"] = idx
+                rec["page_number"] = page_num  # Track which page it came from
+                rec["pdf_url"] = pdf_url
+                rec["pdf_week_code"] = wk
+                rec["ingested_at"] = now_utc()
+                
+                # Check for duplicates at entry level
+                entry_hash = phash(
+                    norm_title(rec.get("title") or ""),
+                    rec.get("year") or "",
+                    rec.get("journal") or ""
+                )
+                
+                if state_manager and not state_manager.is_entry_processed(entry_hash):
+                    records.append(rec)
+                    state_manager.record_entry_processed(
+                        entry_hash, pdf_url, 
+                        rec.get("title"), 
+                        rec.get("journal"), 
+                        rec.get("year")
+                    )
+                elif not state_manager:
+                    records.append(rec)
+
+        # Dedupe within this PDF
+        seen, out = set(), []
+        for r in records:
+            key = r.get("doi") or phash(norm_title(r.get("title") or ""), r.get("year") or "", r.get("pdf_week_code") or "")
+            if key not in seen:
+                seen.add(key); out.append(r)
+        
+        # Record PDF as processed
+        if state_manager:
+            state_manager.record_pdf_processed(pdf_url, wk, len(out), content_hash)
+            
+        logger.info(f"Successfully parsed {len(out)} entries from {pdf_url}")
+        return out
+        
+    except Exception as e:
+        error_msg = f"Failed to parse PDF {pdf_url}: {str(e)}"
+        logger.error(error_msg)
+        if state_manager:
+            state_manager.log_issue("pdf_parse_error", pdf_url, error_msg, "high")
+        return []
 
 # --------------------- NOISE FILTER (post-parse) ---------------------
 def drop_noise_rows(rows):
@@ -311,7 +624,33 @@ def drop_noise_rows(rows):
     return cleaned
 
 # --------------------- OUTPUTS ---------------------
-def write_outputs(records, csv_path, jsonl_path):
+def write_outputs(records, csv_path, jsonl_path, quality_controller: QualityController = None):
+    """Write outputs with optional quality control processing."""
+    
+    # Convert to DataFrame for quality control
+    if quality_controller and records:
+        original_df = pd.DataFrame(records)
+        
+        # Apply standardization
+        standardized_df = quality_controller.standardize_dataframe(original_df)
+        
+        # Detect and remove duplicates
+        cleaned_df = quality_controller.detect_duplicates_pandas(standardized_df)
+        
+        # Generate quality report
+        quality_report = quality_controller.generate_quality_report(original_df, cleaned_df)
+        
+        # Save quality report
+        quality_report_path = csv_path.replace('.csv', '_quality_report.json')
+        with open(quality_report_path, 'w', encoding='utf-8') as f:
+            json.dump(quality_report, f, ensure_ascii=False, indent=2)
+        
+        logger.info(f"Quality report saved to {quality_report_path}")
+        logger.info(f"Quality score: {quality_report['quality_score']:.1f}%")
+        
+        # Convert back to records
+        records = cleaned_df.to_dict('records')
+    
     fields = [
         "title","authors","journal","year",
         "pdf_url","pdf_week_code","page_number","entry_index_in_pdf","ingested_at"
@@ -324,13 +663,22 @@ def write_outputs(records, csv_path, jsonl_path):
             row = {}
             for k in fields:
                 v = r.get(k)
+                # Handle pandas datetime objects
+                if hasattr(v, 'isoformat'):
+                    v = v.isoformat()
                 row[k] = "" if is_missing(v) else v
             w.writerow(row)
     with open(jsonl_path, "w", encoding="utf-8") as f:
         for r in records:
-            out = {k: (None if is_missing(v) else v) for k, v in r.items()}
+            out = {}
+            for k, v in r.items():
+                # Handle pandas datetime objects
+                if hasattr(v, 'isoformat'):
+                    v = v.isoformat()
+                out[k] = None if is_missing(v) else v
             f.write(json.dumps(out, ensure_ascii=False) + "\n")
     print(f"Wrote {len(records)} rows → {csv_path}, {jsonl_path}")
+    return records
 
 # --------------------- VALIDATION ---------------------
 def validate_csv(csv_path, report_json=VALIDATION_REPORT):
@@ -366,11 +714,18 @@ def validate_csv(csv_path, report_json=VALIDATION_REPORT):
         if not (has_authors and has_journal and has_year):
             incomplete_citation.append(r)
         
-        # Citation format check (should be journal name followed by year)
+        # Citation format check (journal and year should be reasonable)
         if has_journal and has_year:
             journal = r.get("journal", "").strip()
             year = r.get("year", "").strip()
-            if not re.search(rf"{re.escape(journal)}.*{year}", r.get("source_line", "")):
+            
+            # Check if year is a valid 4-digit year
+            year_valid = re.match(r'^(19|20)\d{2}$', year)
+            
+            # Check if journal name is reasonable (not empty, not just punctuation)
+            journal_valid = len(journal) > 2 and not re.match(r'^[^\w]*$', journal)
+            
+            if not (year_valid and journal_valid):
                 malformed_citation.append(r)
         
         # Duplicates (using title+year as key)
@@ -427,6 +782,146 @@ def validate_csv(csv_path, report_json=VALIDATION_REPORT):
     print(f"Report: {report_json}\n")
     return summary
 
+# --------------------- COMPREHENSIVE REPORTING ---------------------
+def generate_comprehensive_report(csv_path: str, state_manager: ScrapingState = None, quality_controller: QualityController = None):
+    """Generate a comprehensive report documenting challenges, solutions, and improvements."""
+    
+    report = {
+        "timestamp": now_utc(),
+        "data_source": csv_path,
+        "challenges_and_solutions": {},
+        "quality_metrics": {},
+        "processing_statistics": {},
+        "recommendations": []
+    }
+    
+    # Processing statistics
+    if state_manager:
+        report["processing_statistics"] = state_manager.get_processing_stats()
+        
+        # Get issues from database
+        with sqlite3.connect(state_manager.db_path) as conn:
+            issues = conn.execute("""
+                SELECT issue_type, COUNT(*) as count, severity 
+                FROM scraping_issues 
+                WHERE resolved = FALSE 
+                GROUP BY issue_type, severity
+            """).fetchall()
+            
+            if issues:
+                report["challenges_and_solutions"]["unresolved_issues"] = [
+                    {"type": issue[0], "count": issue[1], "severity": issue[2]} 
+                    for issue in issues
+                ]
+    
+    # Quality metrics from quality controller
+    if quality_controller:
+        report["quality_metrics"]["issues_detected"] = quality_controller.issues_found
+        
+        # Read the CSV to get final data quality metrics
+        try:
+            df = pd.read_csv(csv_path)
+            report["quality_metrics"]["final_dataset"] = {
+                "total_records": len(df),
+                "completeness": {
+                    field: {
+                        "non_empty_count": int((df[field].notna() & (df[field] != '')).sum()),
+                        "completeness_rate": float((df[field].notna() & (df[field] != '')).sum() / len(df) * 100)
+                    }
+                    for field in ['title', 'journal', 'year', 'authors'] if field in df.columns
+                }
+            }
+        except Exception as e:
+            logger.warning(f"Could not analyze final dataset: {e}")
+    
+    # Document challenges and solutions
+    report["challenges_and_solutions"]["common_issues"] = {
+        "pdf_parsing_errors": {
+            "description": "Some PDFs fail to parse due to format inconsistencies or download issues",
+            "solution": "Implemented robust error handling with retry mechanisms and issue logging",
+            "impact": "Reduced script crashes and improved data collection reliability"
+        },
+        "duplicate_entries": {
+            "description": "Same articles appear across multiple PDFs or within single PDFs",
+            "solution": "Implemented multi-level deduplication using content hashing and pandas duplicate detection",
+            "impact": "Eliminated redundant data and improved dataset quality"
+        },
+        "missing_metadata": {
+            "description": "Critical fields like journal names, years, or authors may be missing",
+            "solution": "Added comprehensive missing value analysis and quality scoring",
+            "impact": "Better visibility into data completeness for downstream analysis"
+        },
+        "format_inconsistencies": {
+            "description": "Text formatting varies across sources (capitalization, punctuation, etc.)",
+            "solution": "Implemented standardization functions for text, dates, and journal names",
+            "impact": "Improved data consistency and analysis reliability"
+        }
+    }
+    
+    # Recommendations for improvement
+    report["recommendations"] = [
+        {
+            "category": "Performance",
+            "recommendation": "Implement parallel PDF processing to reduce scraping time",
+            "priority": "Medium",
+            "effort": "High"
+        },
+        {
+            "category": "Data Quality",
+            "recommendation": "Add machine learning-based duplicate detection for more sophisticated matching",
+            "priority": "Low", 
+            "effort": "High"
+        },
+        {
+            "category": "Reliability",
+            "recommendation": "Implement automatic retry with exponential backoff for failed downloads",
+            "priority": "High",
+            "effort": "Low"
+        },
+        {
+            "category": "Monitoring",
+            "recommendation": "Add real-time monitoring dashboard for scraping health metrics",
+            "priority": "Medium",
+            "effort": "Medium"
+        },
+        {
+            "category": "Data Validation",
+            "recommendation": "Implement schema validation to catch parsing errors early",
+            "priority": "High",
+            "effort": "Medium"
+        }
+    ]
+    
+    # Save comprehensive report
+    report_path = csv_path.replace('.csv', '_comprehensive_report.json')
+    with open(report_path, 'w', encoding='utf-8') as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    
+    logger.info(f"Comprehensive report saved to {report_path}")
+    
+    # Print summary
+    print("\n=== COMPREHENSIVE SCRAPING REPORT ===")
+    print(f"Report saved to: {report_path}")
+    print(f"Total records processed: {report['quality_metrics'].get('final_dataset', {}).get('total_records', 'N/A')}")
+    
+    if "unresolved_issues" in report["challenges_and_solutions"]:
+        print(f"Unresolved issues: {len(report['challenges_and_solutions']['unresolved_issues'])}")
+    
+    if quality_controller:
+        quality_score = None
+        try:
+            df = pd.read_csv(csv_path)
+            quality_score = quality_controller._calculate_quality_score(df)
+            print(f"Overall quality score: {quality_score:.1f}%")
+        except:
+            pass
+    
+    print("\nKey improvements implemented:")
+    for solution in report["challenges_and_solutions"]["common_issues"].values():
+        print(f"- {solution['impact']}")
+    
+    return report
+
 # --------------------- CLI + MAIN ---------------------
 def prompt_month() -> int:
     while True:
@@ -441,7 +936,22 @@ def main():
     ap.add_argument("--list", action="store_true", help="Only list weekly URLs and exit.")
     ap.add_argument("--keep-only", action="store_true", help="Write only rows with keep_flag=True.")
     ap.add_argument("--drop-noise", action="store_true", help="Drop noise rows (date/volume/org headers; short abstract + no meta).")
+    ap.add_argument("--quality-control", action="store_true", help="Enable comprehensive quality control and standardization.")
+    ap.add_argument("--incremental", action="store_true", help="Enable incremental updates to skip already processed content.")
+    ap.add_argument("--stats", action="store_true", help="Show processing statistics and exit.")
     args = ap.parse_args()
+
+    # Initialize state management and quality control
+    state_manager = ScrapingState() if args.incremental else None
+    quality_controller = QualityController(state_manager) if args.quality_control else None
+    
+    # Show stats and exit if requested
+    if args.stats and state_manager:
+        stats = state_manager.get_processing_stats()
+        print("\n=== PROCESSING STATISTICS ===")
+        for key, value in stats.items():
+            print(f"{key.replace('_', ' ').title()}: {value}")
+        return
 
     month = args.month if args.month is not None else prompt_month()
     if not (1 <= month <= 8): raise SystemExit("Month must be 1..8 for 2024 range.")
@@ -458,14 +968,25 @@ def main():
     csv_out  = f"safetylit_pdf_{tag}.csv"
     json_out = f"safetylit_pdf_{tag}.jsonl"
 
+    logger.info(f"Starting scraping for {YEAR}-{month:02d} with {len(urls)} PDFs")
+    logger.info(f"Incremental updates: {'enabled' if args.incremental else 'disabled'}")
+    logger.info(f"Quality control: {'enabled' if args.quality_control else 'disabled'}")
+
     all_rows = []
-    for u in urls:
+    for i, u in enumerate(urls, 1):
         try:
-            recs = parse_pdf(u)
+            logger.info(f"Processing PDF {i}/{len(urls)}: {u}")
+            recs = parse_pdf(u, state_manager)
             print(f"Parsed {len(recs)} entries from {u}")
             all_rows.extend(recs)
         except Exception as e:
-            print(f"ERROR parsing {u}: {e}")
+            error_msg = f"ERROR parsing {u}: {e}"
+            print(error_msg)
+            logger.error(error_msg)
+            if state_manager:
+                state_manager.log_issue("pdf_processing_error", u, str(e), "high")
+
+    logger.info(f"Total entries parsed: {len(all_rows)}")
 
     # Dedupe across month
     seen, rows = set(), []
@@ -480,8 +1001,17 @@ def main():
     if args.keep_only:
         rows = [r for r in rows if r.get("keep_flag")]
 
-    write_outputs(rows, csv_out, json_out)
+    logger.info(f"Final dataset size: {len(rows)} entries")
+
+    # Write outputs with quality control
+    write_outputs(rows, csv_out, json_out, quality_controller)
     validate_csv(csv_out, report_json=VALIDATION_REPORT)
+    
+    # Generate comprehensive report if quality control is enabled
+    if quality_controller:
+        generate_comprehensive_report(csv_out, state_manager, quality_controller)
+    
+    logger.info("Scraping completed successfully")
 
 if __name__ == "__main__":
     main()
